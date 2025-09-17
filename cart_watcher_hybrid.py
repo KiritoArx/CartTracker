@@ -41,22 +41,11 @@ TEMPLATE_FILES = [
 # Multi-scale matching
 SCALES = [0.85, 0.9, 1.0, 1.1, 1.15]
 TM_METHOD = cv2.TM_CCOEFF_NORMED
-TM_THRESH = 0.75  # baseline (still used as default)
+TM_THRESH = 0.75
 
-# Per-template thresholds (stricter for 'joined' to avoid false hits)
-TM_THRESH_MAP = {
-    "invite_label.png":   0.75,
-    "carriage_icon.png":  0.75,
-    "join_button.png":    0.80,
-    "joined_button.png":  0.92,  # much stricter
-    "close_x.png":        0.85,
-}
-def score_ok(name, val):
-    return val >= TM_THRESH_MAP.get(name, TM_THRESH)
-
-# Discord webhook (leave as-is; you can rotate/update later)
+# Discord webhook
 ENABLE_DISCORD = True
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/REPLACE_ME/REPLACE_ME"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1417618033492623451/XRplkQ3uLiWXIBk25r1G5QjgF0FyCgTxV1GgZ0IzLckLcLhZdNCzTTrNHd1iziO53rPr"
 DISCORD_USERNAME = "CartTracker"
 DISCORD_AVATAR = None
 MENTION = ""
@@ -72,8 +61,9 @@ DEBUG_DIR = Path("debug_alerts")
 
 toaster = ToastNotifier()
 
+
 def send_discord(content: str):
-    if not ENABLE_DISCORD or not DISCORD_WEBHOOK_URL or "REPLACE_ME" in DISCORD_WEBHOOK_URL:
+    if not ENABLE_DISCORD or not DISCORD_WEBHOOK_URL or "PUT_YOUR_DISCORD" in DISCORD_WEBHOOK_URL:
         return
     payload = {
         "username": DISCORD_USERNAME,
@@ -86,6 +76,7 @@ def send_discord(content: str):
             print(f"[Discord] Error {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"[Discord] Exception: {e}")
+
 
 def save_debug_alert(full_img, join_state, sig, tm_hits, tm_scores, saw_closex):
     try:
@@ -107,6 +98,7 @@ def save_debug_alert(full_img, join_state, sig, tm_hits, tm_scores, saw_closex):
     except Exception as e:
         print(f"[Debug] Failed to save alert debug: {e}")
 
+
 def find_process_pid_by_name(name: str):
     name_lower = name.lower()
     for proc in psutil.process_iter(attrs=["name", "pid"]):
@@ -117,8 +109,10 @@ def find_process_pid_by_name(name: str):
             pass
     return None
 
+
 def enum_windows_for_pid(pid):
     results = []
+
     def callback(hwnd, _):
         if win32gui.IsWindowVisible(hwnd):
             try:
@@ -130,8 +124,10 @@ def enum_windows_for_pid(pid):
             except win32gui.error:
                 pass
         return True
+
     win32gui.EnumWindows(callback, None)
     return results
+
 
 def bring_to_front(hwnd):
     try:
@@ -139,6 +135,7 @@ def bring_to_front(hwnd):
         win32gui.SetForegroundWindow(hwnd)
     except win32gui.error:
         pass
+
 
 def get_capture_region(hwnd, use_client=True):
     if use_client:
@@ -150,6 +147,7 @@ def get_capture_region(hwnd, use_client=True):
     else:
         l, t, r, b = win32gui.GetWindowRect(hwnd)
         return {"left": l, "top": t, "width": (r - l), "height": (b - t)}
+
 
 def find_topheroes_window():
     pid = find_process_pid_by_name(PROCESS_NAME)
@@ -171,19 +169,23 @@ def find_topheroes_window():
             continue
     return best
 
+
 def pil_from_mss(shot):
     return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+
 
 def to_gray(np_rgb):
     return cv2.cvtColor(np_rgb, cv2.COLOR_RGB2GRAY)
 
+
 def crop_rel(gray_img, rel):
     h, w = gray_img.shape[:2]
-    x0 = int(w * rel["x0"]); x1 = int(w * rel["x1"])
-    y0 = int(h * rel["y0"]); y1 = int(h * rel["y1"])
+    x0 = int(w * rel["x0"]); x1 = int(w * rel["x1"]) 
+    y0 = int(h * rel["y0"]); y1 = int(h * rel["y1"]) 
     x0 = max(0, min(x0, w-1)); x1 = max(1, min(x1, w))
     y0 = max(0, min(y0, h-1)); y1 = max(1, min(y1, h))
     return gray_img[y0:y1, x0:x1], (x0, y0, x1, y1)
+
 
 def load_templates():
     loaded = []
@@ -198,6 +200,7 @@ def load_templates():
             continue
         loaded.append((fname, img))
     return loaded
+
 
 def match_templates(gray_crop, templates):
     hits = 0
@@ -217,12 +220,14 @@ def match_templates(gray_crop, templates):
             if score > best:
                 best = score
         scores[name] = best
-        if score_ok(name, best):
+        if best >= TM_THRESH:
             hits += 1
     return hits, scores
 
+
 def sha_short(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
+
 
 def notify(title: str, msg: str):
     try:
@@ -235,10 +240,12 @@ def notify(title: str, msg: str):
     except Exception:
         pass
 
+
 def append_log(line: str):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with open("cart_hits.log", "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {line}\n")
+
 
 def main():
     templates = load_templates()
@@ -310,58 +317,40 @@ def main():
             # Template matching only
             tm_hits, tm_scores = match_templates(gray_crop, templates)
 
-            # Determine join state (only if the card is present)
+            # Determine join state
             score = lambda name: tm_scores.get(name, 0.0)
+            saw_join    = score("join_button.png")   >= TM_THRESH
+            saw_joined  = score("joined_button.png") >= TM_THRESH
+            saw_invite  = score("invite_label.png")  >= TM_THRESH
+            saw_car     = score("carriage_icon.png") >= TM_THRESH
+            saw_closex  = score("close_x.png")       >= TM_THRESH
 
-            s_invite  = score("invite_label.png")
-            s_car     = score("carriage_icon.png")
-            s_join    = score("join_button.png")
-            s_joined  = score("joined_button.png")
-            s_closex  = score("close_x.png")
+            join_state = "Unknown"
+            if saw_join and not saw_joined:
+                join_state = "Joinable"
+            elif saw_joined and not saw_join:
+                join_state = "Already Joined"
+            elif saw_join and saw_joined:
+                join_state = "Joinable" if score("join_button.png") >= score("joined_button.png") else "Already Joined"
 
-            saw_invite = score_ok("invite_label.png",  s_invite)
-            saw_car    = score_ok("carriage_icon.png", s_car)
-            saw_join   = score_ok("join_button.png",   s_join)
-            saw_joined = score_ok("joined_button.png", s_joined)
-            saw_closex = score_ok("close_x.png",       s_closex)
-
+            # Template-only rule: require a card cue and a join UI element
             has_card_cue = (saw_invite or saw_car)
             has_join_ui  = (saw_join or saw_joined)
-            match_ok     = has_card_cue and has_join_ui
+            match_ok = has_card_cue and has_join_ui
 
-            if has_card_cue:
-                # Only report state when the card (invite/carriage) is present
-                if saw_join and not saw_joined:
-                    join_state = "Joinable"
-                elif saw_joined and not saw_join:
-                    join_state = "Already Joined"
-                elif saw_join and saw_joined:
-                    # prefer Joinable if scores are close; else pick higher
-                    join_state = "Joinable" if s_join >= (s_joined + 0.03) else "Already Joined"
-                else:
-                    join_state = "Unknown"
-
-                print(
-                    f"TM hits={tm_hits} state={join_state} | "
-                    f"scores: invite={s_invite:.2f}, car={s_car:.2f}, "
-                    f"join={s_join:.2f}, joined={s_joined:.2f}, x={s_closex:.2f}"
-                )
-            else:
-                # Helpful reason when no alert is possible
-                why = []
-                if not has_card_cue:  why.append("no card cue")
-                if not has_join_ui:   why.append("no join UI")
-                print("[NoAlert] " + ", ".join(why) + " | "
-                      f"scores: invite={s_invite:.2f}, car={s_car:.2f}, "
-                      f"join={s_join:.2f}, joined={s_joined:.2f}, x={s_closex:.2f}")
+            # Debug print
+            print(
+                f"TM hits={tm_hits} state={join_state} | "
+                f"scores: invite={score('invite_label.png'):.2f}, car={score('carriage_icon.png'):.2f}, "
+                f"join={score('join_button.png'):.2f}, joined={score('joined_button.png'):.2f}, x={score('close_x.png'):.2f}"
+            )
 
             if match_ok:
-                sig_source = f"{('Joinable' if saw_join else 'Already Joined')}|{tm_scores}"
+                sig_source = f"{join_state}|{tm_scores}"
                 sig = sha_short(sig_source)
                 last_t = last_seen.get(sig, 0)
                 if (time.time() - last_t) > ALERT_COOLDOWN_SEC:
-                    join_state = "Joinable" if saw_join else "Already Joined"
-                    msg = f"Cart Invite Detected — {join_state} | tm_hits={tm_hits}" + (" (+X)" if saw_closex else "")
+                    msg = f"Cart Invite Detected — {join_state} | tm={tm_hits}" + (" (+X)" if saw_closex else "")
                     notify("Cart Invite Detected", msg)
                     append_log(f"{join_state} | {tm_scores}")
                     send_discord(msg)
@@ -393,5 +382,7 @@ def main():
         except Exception:
             pass
 
+
 if __name__ == "__main__":
     main()
+
