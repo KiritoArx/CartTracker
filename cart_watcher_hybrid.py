@@ -1,11 +1,9 @@
 import time
-import re
 import hashlib
 from collections import deque
 from pathlib import Path
 
 import psutil
-import pytesseract
 import mss
 import numpy as np
 import cv2
@@ -26,16 +24,11 @@ USE_CLIENT_AREA = True
 CAPTURE_EVERY_SEC = 0.9
 REFRESH_RECT_EVERY_SEC = 2
 HOTKEY_STOP = "m"
-TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # Scan the full game window
 CHAT_CROP = dict(x0=0.00, x1=1.00, y0=0.00, y1=1.00)
 
-# OCR keywords
-OCR_KEYWORDS = {"invite", "carriage", "join"}
-WAITING_RE = re.compile(r"waiting\s*time\s*:\s*\d{1,2}:\d{2}:\d{2}", re.I)
-
-# Templates
+# Templates (template-only; no OCR)
 TEMPLATE_DIR = Path("templates")
 TEMPLATE_FILES = [
     "invite_label.png",   # "Invite" chunk
@@ -49,8 +42,6 @@ TEMPLATE_FILES = [
 SCALES = [0.85, 0.9, 1.0, 1.1, 1.15]
 TM_METHOD = cv2.TM_CCOEFF_NORMED
 TM_THRESH = 0.75
-REQUIRED_TM_HITS = 2
-REQUIRED_OCR_HITS = 1
 
 # Discord webhook
 ENABLE_DISCORD = True
@@ -68,8 +59,8 @@ DEBUG_SAVE_ON_ALERT = True
 DEBUG_DIR = Path("debug_alerts")
 # --------------------------------------
 
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 toaster = ToastNotifier()
+
 
 def send_discord(content: str):
     if not ENABLE_DISCORD or not DISCORD_WEBHOOK_URL or "PUT_YOUR_DISCORD" in DISCORD_WEBHOOK_URL:
@@ -86,7 +77,8 @@ def send_discord(content: str):
     except Exception as e:
         print(f"[Discord] Exception: {e}")
 
-def save_debug_alert(full_img, ocr_img, join_state, sig, kw_hits, tm_hits, tm_scores, text, saw_closex):
+
+def save_debug_alert(full_img, join_state, sig, tm_hits, tm_scores, saw_closex):
     try:
         DEBUG_DIR.mkdir(exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -95,20 +87,17 @@ def save_debug_alert(full_img, ocr_img, join_state, sig, kw_hits, tm_hits, tm_sc
         # Full screenshot
         full_img.save(DEBUG_DIR / f"{base}_full.png")
 
-        # OCR preprocessed
-        ocr_img.save(DEBUG_DIR / f"{base}_ocr.png")
-
         # Metadata
         meta_path = DEBUG_DIR / f"{base}_meta.txt"
         with open(meta_path, "w", encoding="utf-8") as f:
             f.write(f"JoinState: {join_state}\n")
-            f.write(f"kw_hits={kw_hits}, tm_hits={tm_hits}, close_x={saw_closex}\n")
+            f.write(f"tm_hits={tm_hits}, close_x={saw_closex}\n")
             f.write("Scores:\n")
             for k, v in tm_scores.items():
                 f.write(f"  {k}: {v:.2f}\n")
-            f.write("\nOCR text:\n" + text + "\n")
     except Exception as e:
         print(f"[Debug] Failed to save alert debug: {e}")
+
 
 def find_process_pid_by_name(name: str):
     name_lower = name.lower()
@@ -120,8 +109,10 @@ def find_process_pid_by_name(name: str):
             pass
     return None
 
+
 def enum_windows_for_pid(pid):
     results = []
+
     def callback(hwnd, _):
         if win32gui.IsWindowVisible(hwnd):
             try:
@@ -133,8 +124,10 @@ def enum_windows_for_pid(pid):
             except win32gui.error:
                 pass
         return True
+
     win32gui.EnumWindows(callback, None)
     return results
+
 
 def bring_to_front(hwnd):
     try:
@@ -142,6 +135,7 @@ def bring_to_front(hwnd):
         win32gui.SetForegroundWindow(hwnd)
     except win32gui.error:
         pass
+
 
 def get_capture_region(hwnd, use_client=True):
     if use_client:
@@ -153,6 +147,7 @@ def get_capture_region(hwnd, use_client=True):
     else:
         l, t, r, b = win32gui.GetWindowRect(hwnd)
         return {"left": l, "top": t, "width": (r - l), "height": (b - t)}
+
 
 def find_topheroes_window():
     pid = find_process_pid_by_name(PROCESS_NAME)
@@ -174,19 +169,23 @@ def find_topheroes_window():
             continue
     return best
 
+
 def pil_from_mss(shot):
     return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+
 
 def to_gray(np_rgb):
     return cv2.cvtColor(np_rgb, cv2.COLOR_RGB2GRAY)
 
+
 def crop_rel(gray_img, rel):
     h, w = gray_img.shape[:2]
-    x0 = int(w * rel["x0"]); x1 = int(w * rel["x1"])
-    y0 = int(h * rel["y0"]); y1 = int(h * rel["y1"])
+    x0 = int(w * rel["x0"]); x1 = int(w * rel["x1"]) 
+    y0 = int(h * rel["y0"]); y1 = int(h * rel["y1"]) 
     x0 = max(0, min(x0, w-1)); x1 = max(1, min(x1, w))
     y0 = max(0, min(y0, h-1)); y1 = max(1, min(y1, h))
     return gray_img[y0:y1, x0:x1], (x0, y0, x1, y1)
+
 
 def load_templates():
     loaded = []
@@ -201,6 +200,7 @@ def load_templates():
             continue
         loaded.append((fname, img))
     return loaded
+
 
 def match_templates(gray_crop, templates):
     hits = 0
@@ -224,26 +224,10 @@ def match_templates(gray_crop, templates):
             hits += 1
     return hits, scores
 
-def preprocess_for_ocr(gray_crop):
-    blur = cv2.medianBlur(gray_crop, 3)
-    thr = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                cv2.THRESH_BINARY, 31, 9)
-    return Image.fromarray(thr)
-
-def normalize_text(s: str) -> str:
-    s = s.replace("|", "l").replace("0", "o").replace("§", "s").replace("£", "l")
-    s = re.sub(r"[^\x20-\x7E]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip().lower()
-    return s
-
-def count_keywords(text: str, keywords: set) -> int:
-    n = sum(1 for k in keywords if k in text)
-    if WAITING_RE.search(text):
-        n += 1
-    return n
 
 def sha_short(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
+
 
 def notify(title: str, msg: str):
     try:
@@ -256,10 +240,12 @@ def notify(title: str, msg: str):
     except Exception:
         pass
 
+
 def append_log(line: str):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with open("cart_hits.log", "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {line}\n")
+
 
 def main():
     templates = load_templates()
@@ -328,18 +314,8 @@ def main():
             # Crop
             gray_crop, _ = crop_rel(gray_full, CHAT_CROP)
 
-            # 1) Template matching
+            # Template matching only
             tm_hits, tm_scores = match_templates(gray_crop, templates)
-
-            # 2) OCR
-            pil_for_ocr = preprocess_for_ocr(gray_crop)
-            try:
-                raw_text = pytesseract.image_to_string(pil_for_ocr)
-            except Exception as e:
-                print(f"OCR error: {e}")
-                raw_text = ""
-            text = normalize_text(raw_text)
-            kw_hits = count_keywords(text, OCR_KEYWORDS)
 
             # Determine join state
             score = lambda name: tm_scores.get(name, 0.0)
@@ -357,36 +333,33 @@ def main():
             elif saw_join and saw_joined:
                 join_state = "Joinable" if score("join_button.png") >= score("joined_button.png") else "Already Joined"
 
-            # Hybrid rule
+            # Template-only rule: require a card cue and a join UI element
             has_card_cue = (saw_invite or saw_car)
             has_join_ui  = (saw_join or saw_joined)
-            hybrid_ok = has_card_cue and has_join_ui and (kw_hits >= REQUIRED_OCR_HITS)
+            match_ok = has_card_cue and has_join_ui
 
             # Debug print
-            if text:
-                print(
-                    f"TM hits={tm_hits} kw={kw_hits} state={join_state} | "
-                    f"scores: invite={score('invite_label.png'):.2f}, car={score('carriage_icon.png'):.2f}, "
-                    f"join={score('join_button.png'):.2f}, joined={score('joined_button.png'):.2f}, x={score('close_x.png'):.2f} | "
-                    f"Text: {text[:160]}"
-                )
+            print(
+                f"TM hits={tm_hits} state={join_state} | "
+                f"scores: invite={score('invite_label.png'):.2f}, car={score('carriage_icon.png'):.2f}, "
+                f"join={score('join_button.png'):.2f}, joined={score('joined_button.png'):.2f}, x={score('close_x.png'):.2f}"
+            )
 
-            # A) Real cart (strict hybrid)
-            if hybrid_ok:
-                sig_source = f"{join_state}|{text if text else tm_scores}"
+            if match_ok:
+                sig_source = f"{join_state}|{tm_scores}"
                 sig = sha_short(sig_source)
                 last_t = last_seen.get(sig, 0)
                 if (time.time() - last_t) > ALERT_COOLDOWN_SEC:
-                    msg = f"Cart Invite Detected — {join_state} | kw={kw_hits}, tm={tm_hits}" + (" (+X)" if saw_closex else "")
+                    msg = f"Cart Invite Detected — {join_state} | tm={tm_hits}" + (" (+X)" if saw_closex else "")
                     notify("Cart Invite Detected", msg)
-                    append_log(f"{join_state} | {text if text else tm_scores}")
+                    append_log(f"{join_state} | {tm_scores}")
                     send_discord(msg)
 
                     if DEBUG_SAVE_ON_ALERT:
                         try:
                             save_debug_alert(
-                                pil_img, pil_for_ocr, join_state, sig,
-                                kw_hits, tm_hits, tm_scores, text, saw_closex
+                                pil_img, join_state, sig,
+                                tm_hits, tm_scores, saw_closex
                             )
                         except Exception as e:
                             print(f"[Debug] Exception during debug save: {e}")
@@ -409,5 +382,7 @@ def main():
         except Exception:
             pass
 
+
 if __name__ == "__main__":
     main()
+

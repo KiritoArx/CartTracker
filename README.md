@@ -1,1 +1,1 @@
-pip install psutil pytesseract mss numpy opencv-python pillow keyboard win10toast requests pywin32
+pip install psutil mss numpy opencv-python pillow keyboard win10toast requests pywin32
