@@ -1,344 +1,139 @@
 import time
-import hashlib
-from collections import deque
-from pathlib import Path
-
-import psutil
-import mss
-import numpy as np
 import cv2
-from PIL import Image
-import keyboard
-from win10toast import ToastNotifier
-import winsound
+import numpy as np
+import mss
 import requests
+import keyboard
+from pathlib import Path
+from collections import deque
 
-# Windows APIs
-import win32gui
-import win32con
-import win32process
-
-# ================== CONFIG (simple) ==================
-PROCESS_NAME = "TopHeroes.exe"
-USE_CLIENT_AREA = True
-CAPTURE_EVERY_SEC = 0.9
-REFRESH_RECT_EVERY_SEC = 2
+# ------------ CONFIG ------------
+CAPTURE_EVERY_SEC = 0.8
 HOTKEY_STOP = "m"
 
-# Scan almost everything for cues; scan only lower chunk for buttons (faster + fewer false hits)
-SEARCH_CROP = dict(x0=0.00, x1=1.00, y0=0.00, y1=1.00)  # for Invite/Carriage
-BUTTON_CROP  = dict(x0=0.08, x1=0.92, y0=0.55, y1=0.96)  # for Join/Joined buttons
+# Scan full screen (primary monitor via mss). Quiet terminal until an alert.
+# Your templates folder (put the PNGs here or change path):
+TEMPLATES_DIR = Path("templates")
 
-# Templates
-TEMPLATE_DIR = Path("templates")
-CUE_TEMPLATES = ["invite_label.png", "carriage_icon.png"]
-JOIN_TEMPLATE = "join_button.png"
-JOINED_TEMPLATE = "joined_button.png"
+# Template filenames (must exist)
+FILES = {
+    "invite_label":  "invite_label.png",    # carriage visible (tab label)
+    "carriage_icon": "carriage_icon.png",   # horse head icon
+    "join_button":   "join_button.png",     # green join button
+    "joined_button": "joined_button.png",   # gray joined (no alert)
+    "close_x":       "close_x.png",         # optional; not used for alerting
+}
 
-# Matching
-SCALES_CUE   = [0.90, 1.00, 1.10]
-SCALES_BTN   = [0.90, 1.00, 1.10]
-TM_METHOD    = cv2.TM_CCOEFF_NORMED
-CUE_THRESH   = 0.82     # see the cue somewhere
-JOIN_THRESH  = 0.84     # green Join button present
-JOINED_THRESH= 0.84     # gray Joined button present
-WIN_MARGIN   = 0.02     # tiny edge so one button "wins" if both show
-
-# Alerts
-ALERT_COOLDOWN_SEC = 25
-RECENT_MAX = 120
-
-# Debug saving
-DEBUG_SAVE_ON_ALERT = True
-DEBUG_DIR = Path("debug_alerts")
-
-# Discord (leave as-is if you want)
-ENABLE_DISCORD = True
+# Discord webhook (rotate if this ever leaks)
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1417618033492623451/XRplkQ3uLiWXIBk25r1G5QjgF0FyCgTxV1GgZ0IzLckLcLhZdNCzTTrNHd1iziO53rPr"
-DISCORD_USERNAME = "CartTracker"
-DISCORD_AVATAR = None
-MENTION = ""
-# =====================================================
 
-toaster = ToastNotifier()
+# Matching thresholds (tune if needed)
+TH_MAIN = 0.83      # for invite_label / carriage_icon / join_button
+TH_JOINED = 0.86    # for joined_button (a bit stricter)
 
-# ---------- Utils ----------
-def pil_from_mss(shot):
-    return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+# Multi-scale search settings (handles different UI sizes)
+SCALES = np.linspace(0.80, 1.30, 9)  # try 9 scales from 80% to 130%
 
-def to_gray(np_rgb):
-    return cv2.cvtColor(np_rgb, cv2.COLOR_RGB2GRAY)
+# Debounce: after one alert, wait this many seconds before sending another
+ALERT_COOLDOWN_SEC = 18
 
-def crop_rel(img, rel):
-    """Crop by relative box on either gray or RGB image."""
-    h, w = (img.shape[:2] if img.ndim >= 2 else (0, 0))
-    x0 = int(w * rel["x0"]); x1 = int(w * rel["x1"])
-    y0 = int(h * rel["y0"]); y1 = int(h * rel["y1"])
-    x0 = max(0, min(x0, w-1)); x1 = max(1, min(x1, w))
-    y0 = max(0, min(y0, h-1)); y1 = max(1, min(y1, h))
-    return img[y0:y1, x0:x1], (x0, y0, x1, y1)
+# --------------------------------
 
-def sha_short(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
+def load_templates():
+    bank = {}
+    for key, fname in FILES.items():
+        p = (TEMPLATES_DIR / fname)
+        if not p.exists():
+            # also allow absolute paths (like the ones you showed me)
+            p = Path(fname)
+        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Template missing or unreadable: {p}")
+        bank[key] = img
+    return bank
 
-def notify(title: str, msg: str):
-    try:
-        toaster.show_toast(title, msg, duration=4, threaded=True)
-    except Exception:
-        pass
-    try:
-        winsound.Beep(1400, 160)
-        winsound.Beep(1000, 120)
-    except Exception:
-        pass
-
-def append_log(line: str):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open("cart_hits.log", "a", encoding="utf-8") as f:
-        f.write(f"[{ts}] {line}\n")
-
-# ---------- Discord ----------
-def send_discord(content: str):
-    if not ENABLE_DISCORD or not DISCORD_WEBHOOK_URL or "PUT_YOUR_DISCORD" in DISCORD_WEBHOOK_URL:
-        return
-    payload = {"username": DISCORD_USERNAME, "avatar_url": DISCORD_AVATAR, "content": (MENTION + " " + content).strip()}
-    try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
-        if r.status_code >= 300:
-            print(f"[Discord] Error {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        print(f"[Discord] Exception: {e}")
-
-# ---------- Window ----------
-def find_process_pid_by_name(name: str):
-    for proc in psutil.process_iter(attrs=["name", "pid"]):
-        try:
-            if proc.info["name"] and proc.info["name"].lower() == name.lower():
-                return proc.info["pid"]
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    return None
-
-def enum_windows_for_pid(pid):
-    results = []
-    def callback(hwnd, _):
-        if win32gui.IsWindowVisible(hwnd):
-            try:
-                _, found_pid = win32process.GetWindowThreadProcessId(hwnd)
-                if found_pid == pid:
-                    l, t, r, b = win32gui.GetWindowRect(hwnd)
-                    if (r - l) > 100 and (b - t) > 100:
-                        results.append(hwnd)
-            except win32gui.error:
-                pass
-        return True
-    win32gui.EnumWindows(callback, None)
-    return results
-
-def bring_to_front(hwnd):
-    try:
-        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        win32gui.SetForegroundWindow(hwnd)
-    except win32gui.error:
-        pass
-
-def get_capture_region(hwnd, use_client=True):
-    if use_client:
-        lt = win32gui.ClientToScreen(hwnd, (0, 0))
-        cl = win32gui.GetClientRect(hwnd)
-        return {"left": lt[0], "top": lt[1], "width": cl[2] - cl[0], "height": cl[3] - cl[1]}
-    else:
-        l, t, r, b = win32gui.GetWindowRect(hwnd)
-        return {"left": l, "top": t, "width": (r - l), "height": (b - t)}
-
-def find_topheroes_window():
-    pid = find_process_pid_by_name(PROCESS_NAME)
-    if not pid:
-        return None
-    hwnds = enum_windows_for_pid(pid)
-    if not hwnds:
-        return None
-    best, area_best = None, 0
-    for h in hwnds:
-        try:
-            l, t, r, b = win32gui.GetWindowRect(h)
-            area = max(0, r - l) * max(0, b - t)
-            if area > area_best:
-                area_best, best = area, h
-        except win32gui.error:
+def best_match_multi_scale(haystack_gray, needle_gray, method=cv2.TM_CCOEFF_NORMED):
+    """
+    Search haystack for needle across SCALES.
+    Returns (max_val, top_left, bottom_right, scale).
+    """
+    best = (-1.0, None, None, None)
+    hN, wN = needle_gray.shape[:2]
+    for s in SCALES:
+        # resize template
+        w = max(8, int(wN * s))
+        h = max(8, int(hN * s))
+        tpl = cv2.resize(needle_gray, (w, h), interpolation=cv2.INTER_AREA)
+        if haystack_gray.shape[0] < h or haystack_gray.shape[1] < w:
             continue
+        res = cv2.matchTemplate(haystack_gray, tpl, method)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        val = max_val if method in (cv2.TM_CCOEFF, cv2.TM_CCOEFF_NORMED, cv2.TM_CCORR, cv2.TM_CCORR_NORMED) else -min_val
+        loc = max_loc if method in (cv2.TM_CCOEFF, cv2.TM_CCOEFF_NORMED, cv2.TM_CCORR, cv2.TM_CCORR_NORMED) else min_loc
+        if val > best[0]:
+            top_left = loc
+            bottom_right = (top_left[0] + w, top_left[1] + h)
+            best = (val, top_left, bottom_right, s)
     return best
 
-# ---------- Template loading & matching ----------
-def load_template_gray(name: str):
-    p = TEMPLATE_DIR / name
-    img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        print(f"[WARN] Missing or unreadable template: {p}")
-    return img
-
-def best_match_score(gray_img, tmpl, scales):
-    """Return the best normalized correlation score across scales."""
-    if tmpl is None:
-        return 0.0
-    best = 0.0
-    th, tw = tmpl.shape[:2]
-    for s in scales:
-        tw2 = max(8, int(tw * s))
-        th2 = max(8, int(th * s))
-        if gray_img.shape[0] < th2 or gray_img.shape[1] < tw2:
-            continue
-        tmpl_s = cv2.resize(tmpl, (tw2, th2), interpolation=cv2.INTER_AREA)
-        res = cv2.matchTemplate(gray_img, tmpl_s, TM_METHOD)
-        _, max_val, _, _ = cv2.minMaxLoc(res)
-        if max_val > best:
-            best = max_val
-    return float(best)
-
-# ---------- Debug ----------
-def save_debug_alert(full_img, join_state, sig, scores):
+def send_webhook(msg):
     try:
-        DEBUG_DIR.mkdir(exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        base = f"{ts}_{join_state}_{sig}"
-        full_img.save(DEBUG_DIR / f"{base}_full.png")
-        with open(DEBUG_DIR / f"{base}_meta.txt", "w", encoding="utf-8") as f:
-            f.write(f"state={join_state}\n")
-            for k, v in scores.items():
-                f.write(f"{k}={v:.3f}\n")
-    except Exception as e:
-        print(f"[Debug] Save fail: {e}")
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=5)
+    except Exception:
+        # Stay quiet in terminal by design; if you want logs, print the exception.
+        pass
 
-# ---------- Main ----------
 def main():
     # Load templates
-    tmpl_inv   = load_template_gray(CUE_TEMPLATES[0])
-    tmpl_car   = load_template_gray(CUE_TEMPLATES[1])
-    tmpl_join  = load_template_gray(JOIN_TEMPLATE)
-    tmpl_joined= load_template_gray(JOINED_TEMPLATE)
-
-    print("Templates loaded:",
-          f"invite={'OK' if tmpl_inv is not None else 'X'}",
-          f"carriage={'OK' if tmpl_car is not None else 'X'}",
-          f"join={'OK' if tmpl_join is not None else 'X'}",
-          f"joined={'OK' if tmpl_joined is not None else 'X'}")
-
-    print(f"Looking for process: {PROCESS_NAME}")
-    stop_flag = {"stop": False}
-
-    def on_stop():
-        stop_flag["stop"] = True
-        print("\n[Hotkey] Stop requested...")
-
-    keyboard.add_hotkey(HOTKEY_STOP, on_stop)
-    print(f"Press '{HOTKEY_STOP}' at any time to stop.\n")
-
+    bank = load_templates()
+    # Prepare capture
     sct = mss.mss()
-    hwnd = None
-    region = None
-    last_rect_refresh = 0
+    monitor = sct.monitors[1]  # primary monitor
+    # Silent until first alert
+    last_alert_ts = 0.0
+    recent_states = deque(maxlen=10)  # small memory for debugging if needed
 
-    recent = deque(maxlen=RECENT_MAX)
-    last_seen = {}
+    while True:
+        if keyboard.is_pressed(HOTKEY_STOP):
+            break
 
-    try:
-        while not stop_flag["stop"]:
-            if hwnd is None:
-                hwnd = find_topheroes_window()
-                if hwnd:
-                    title = win32gui.GetWindowText(hwnd)
-                    print(f"Attached to window: {title} (hwnd={hwnd})")
-                    bring_to_front(hwnd)
-                    region = get_capture_region(hwnd, USE_CLIENT_AREA)
-                    print(f"Initial capture region: {region}")
-                else:
-                    print("TopHeroes.exe not found. Retrying in 3s...")
-                    time.sleep(3)
-                    continue
+        img = np.array(sct.grab(monitor))  # BGRA
+        frame = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
 
-            # Periodic region refresh
-            now = time.time()
-            if now - last_rect_refresh > REFRESH_RECT_EVERY_SEC:
-                try:
-                    region = get_capture_region(hwnd, USE_CLIENT_AREA)
-                except win32gui.error:
-                    print("Lost window. Re-attaching...")
-                    hwnd = None
-                    time.sleep(2)
-                    continue
-                last_rect_refresh = now
+        # Try to detect a "carriage present" signal
+        found_scores = {}
 
-            # Capture
-            try:
-                shot = sct.grab(region)
-            except Exception as e:
-                print(f"Capture error: {e}. Re-attaching...")
-                hwnd = None
-                time.sleep(2)
-                continue
+        # The three "carriage present" cues
+        for key in ("invite_label", "carriage_icon", "join_button"):
+            score, tl, br, sc = best_match_multi_scale(frame, bank[key])
+            found_scores[key] = score
 
-            pil_img = pil_from_mss(shot)
-            np_rgb_full = np.array(pil_img)
-            gray_full = to_gray(np_rgb_full)
-            # light blur can stabilize small lighting changes
-            gray_full = cv2.GaussianBlur(gray_full, (3, 3), 0)
+        # "Already joined" check (no alert; just marks state)
+        joined_score, _, _, _ = best_match_multi_scale(frame, bank["joined_button"])
+        found_scores["joined_button"] = joined_score
 
-            # Crops
-            gray_search, _ = crop_rel(gray_full, SEARCH_CROP)
-            gray_btn, _    = crop_rel(gray_full, BUTTON_CROP)
+        carriage_present = (
+            (found_scores["invite_label"]  >= TH_MAIN) or
+            (found_scores["carriage_icon"] >= TH_MAIN) or
+            (found_scores["join_button"]   >= TH_MAIN)
+        )
 
-            # 1) Cart cue: invite OR carriage anywhere in SEARCH_CROP
-            sc_inv = best_match_score(gray_search, tmpl_inv, SCALES_CUE)
-            sc_car = best_match_score(gray_search, tmpl_car, SCALES_CUE)
-            cue_ok = (sc_inv >= CUE_THRESH) or (sc_car >= CUE_THRESH)
+        now = time.time()
 
-            # 2) Button: Join vs Joined in BUTTON_CROP
-            sc_join   = best_match_score(gray_btn, tmpl_join,   SCALES_BTN)
-            sc_joined = best_match_score(gray_btn, tmpl_joined, SCALES_BTN)
+        # Alert logic (debounced)
+        if carriage_present and (now - last_alert_ts) >= ALERT_COOLDOWN_SEC:
+            joined_flag = (joined_score >= TH_JOINED)
+            # Compose message
+            if joined_flag:
+                msg = "🟢 **Carriage spotted** (already joined)."
+            else:
+                # emphasize to hurry
+                msg = "🟢 **Carriage appeared!** Check chat now."
+            send_webhook(msg)
+            last_alert_ts = now
 
-            # Simple state rule (template-only)
-            state = "Unknown"
-            if cue_ok:
-                if (sc_join >= JOIN_THRESH) and (sc_join >= sc_joined + WIN_MARGIN):
-                    state = "Joinable"
-                elif (sc_joined >= JOINED_THRESH) and (sc_joined >= sc_join + WIN_MARGIN):
-                    state = "Already Joined"
-
-            print(f"cue(inv={sc_inv:.2f} car={sc_car:.2f} ok={cue_ok}) | "
-                  f"join={sc_join:.2f} joined={sc_joined:.2f} => {state}")
-
-            # Alert only when NEW & Joinable (you haven't joined yet)
-            if state == "Joinable":
-                # Use coarse signature from scores to rate-limit
-                sig_source = f"{state}|{round(sc_join,3)}|{round(sc_inv,3)}|{round(sc_car,3)}"
-                sig = sha_short(sig_source)
-                last_t = last_seen.get(sig, 0)
-                if (time.time() - last_t) > ALERT_COOLDOWN_SEC:
-                    msg = "Cart Invite Detected — Joinable"
-                    notify("Cart Invite Detected", msg)
-                    append_log(f"{state} | inv={sc_inv:.3f} car={sc_car:.3f} join={sc_join:.3f} joined={sc_joined:.3f}")
-                    send_discord(msg)
-                    if DEBUG_SAVE_ON_ALERT:
-                        save_debug_alert(pil_img, state, sig, {
-                            "inv": sc_inv, "car": sc_car, "join": sc_join, "joined": sc_joined
-                        })
-                    last_seen[sig] = time.time()
-                    recent.append(sig)
-
-            # pacing + hotkey responsive sleep
-            for _ in range(int(CAPTURE_EVERY_SEC * 10)):
-                if stop_flag["stop"]:
-                    break
-                time.sleep(0.1)
-
-    except KeyboardInterrupt:
-        print("\n[Ctrl+C] Stopping...")
-    finally:
-        print("Exiting watcher.")
-        try:
-            keyboard.unhook_all_hotkeys()
-        except Exception:
-            pass
+        # Keep terminal quiet per your request
+        time.sleep(CAPTURE_EVERY_SEC)
 
 if __name__ == "__main__":
     main()
