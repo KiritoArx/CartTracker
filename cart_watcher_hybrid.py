@@ -11,6 +11,7 @@ import win32con
 import keyboard
 import requests
 import threading
+from collections import deque
 
 # ======================
 # CONFIGURATION
@@ -23,9 +24,8 @@ MATCH_THRESHOLD = 0.7
 HOTKEY_STOP = "m"
 HOTKEY_DEBUG_SCREENSHOT = "p"
 
-# Load webhook from env for safety. Set DISCORD_WEBHOOK_URL in your system env if you want alerts.
+# Prefer env var, else fallback (rotate if shared)
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1417618033492623451/XRplkQ3uLiWXIBk25r1G5QjgF0FyCgTxV1GgZ0IzLckLcLhZdNCzTTrNHd1iziO53rPr"
-
 
 TEMPLATES_DIR = "templates"
 CARRIAGE_DETECTION_TEMPLATES = {
@@ -37,6 +37,16 @@ CARRIAGE_RESET_TEMPLATES = {
     "joined_button": os.path.join(TEMPLATES_DIR, "joined_button.png"),
     "close_x": os.path.join(TEMPLATES_DIR, "close_x.png"),
 }
+NO_ALERT_TEMPLATES = {
+    "no_alert": os.path.join(TEMPLATES_DIR, "NoAlert.png"),
+}
+
+# ---- New: multi-signal rule & stability ----
+REQUIRED_DETECTION_KEYS = ["invite_label", "carriage_icon", "join_button"]  # which templates count toward the vote
+REQUIRED_DETECTION_MIN = 2       # K: need at least 2 of the above in the same frame
+PERSIST_FRAMES = 2               # P: rule must hold for this many consecutive frames
+
+SUPPRESS_COOLDOWN_SEC = 8.0      # when NoAlert is seen
 
 # ======================
 # GLOBALS
@@ -44,6 +54,10 @@ CARRIAGE_RESET_TEMPLATES = {
 running = True
 last_screenshot = None
 script_lock = threading.Lock()
+
+# Track detection stability
+rule_pass_history = deque(maxlen=PERSIST_FRAMES)
+carriage_notified = False
 
 # ======================
 # UTIL
@@ -56,35 +70,34 @@ def _pid_has_name(pid: int, name: str) -> bool:
         return False
 
 def find_game_window(process_name: str):
-    """Return (hwnd, rect) for the first visible, enabled top level window owned by process_name. Otherwise (None, None)."""
     target = {"hwnd": None, "rect": None}
 
     def callback(h, _):
         if not win32gui.IsWindowVisible(h) or not win32gui.IsWindowEnabled(h):
             return True
         try:
-            _, pid = win32process.GetWindowThreadProcessId(h)
+            _tid, pid = win32process.GetWindowThreadProcessId(h)
             if pid and _pid_has_name(pid, process_name):
                 rect = win32gui.GetWindowRect(h)
                 target["hwnd"] = h
                 target["rect"] = rect
-                return False  # stop enum
+                return False
         except Exception:
-            pass
+            return True
         return True
 
-    win32gui.EnumWindows(callback, None)
+    try:
+        win32gui.EnumWindows(callback, None)
+    except Exception:
+        return None, None
+
     return target["hwnd"], target["rect"]
 
 def focus_window(hwnd):
-    """Try to restore and bring window to foreground."""
     try:
-        # Restore if minimized
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        # Simple foreground attempt
         win32gui.SetForegroundWindow(hwnd)
     except Exception:
-        # Foreground permission workaround
         try:
             user32 = ctypes.windll.user32
             cur_thread = win32process.GetCurrentThreadId()
@@ -97,11 +110,10 @@ def focus_window(hwnd):
             pass
 
 def rect_to_monitor(rect):
-    left, top, right, bottom = rect
-    return {"left": left, "top": top, "width": right - left, "height": bottom - top}
+    l, t, r, b = rect
+    return {"left": l, "top": t, "width": r - l, "height": b - t}
 
 def load_templates(paths_dict):
-    """Read templates once and cache grayscale versions. Return dict[name] = gray_image."""
     loaded = {}
     for name, path in paths_dict.items():
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
@@ -114,22 +126,51 @@ def load_templates(paths_dict):
         loaded[name] = gray
     return loaded
 
-def find_template(screen_gray, template_gray, threshold):
-    """Basic template match, returns True if any location meets threshold."""
+def match_score(screen_gray, template_gray):
     if screen_gray.shape[0] < template_gray.shape[0] or screen_gray.shape[1] < template_gray.shape[1]:
-        return False
-    result = cv2.matchTemplate(screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, _ = cv2.minMaxLoc(result)
-    return max_val >= threshold
+        return 0.0
+    res = cv2.matchTemplate(screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, _ = cv2.minMaxLoc(res)
+    return float(max_val)
+
+def find_hits(screen_gray, template_bank, keys=None, threshold=MATCH_THRESHOLD):
+    """Return dict {name:score} for all templates (or subset 'keys') that meet threshold."""
+    hits = {}
+    items = template_bank.items() if keys is None else [(k, template_bank[k]) for k in keys if k in template_bank]
+    for name, tmpl in items:
+        s = match_score(screen_gray, tmpl)
+        if s >= threshold:
+            hits[name] = s
+    return hits
+
+def _mask_webhook(url: str) -> str:
+    if not url:
+        return "(unset)"
+    return url[:35] + "..." + url[-6:]
+
+def check_webhook():
+    if not DISCORD_WEBHOOK_URL or "REDACTED" in DISCORD_WEBHOOK_URL:
+        print("WARN Discord webhook URL not set. Set env var DISCORD_WEBHOOK_URL or hardcode it.")
+    else:
+        print(f"Discord webhook configured: {_mask_webhook(DISCORD_WEBHOOK_URL)}")
 
 def send_discord_notification(message):
-    if not DISCORD_WEBHOOK_URL:
+    if not DISCORD_WEBHOOK_URL or "REDACTED" in DISCORD_WEBHOOK_URL:
         print("WARN Discord webhook URL not set. Skipping notification.")
         return
     try:
         r = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
         if r.status_code in (200, 204):
             print("Discord notification sent.")
+        elif r.status_code == 429:
+            retry_after = float(r.headers.get("Retry-After", "1"))
+            print(f"Discord rate limited. Retrying after {retry_after:.1f}s...")
+            time.sleep(retry_after)
+            r2 = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+            if r2.status_code in (200, 204):
+                print("Discord notification sent (after retry).")
+            else:
+                print(f"Discord error after retry {r2.status_code} {r2.text}")
         else:
             print(f"Discord error {r.status_code} {r.text}")
     except requests.RequestException as e:
@@ -159,20 +200,23 @@ def setup_hotkeys():
 # MAIN BOT
 # ======================
 def run_bot():
-    global last_screenshot
+    global last_screenshot, carriage_notified
 
     print("Loading templates...")
     try:
         detection_templates = load_templates(CARRIAGE_DETECTION_TEMPLATES)
         reset_templates = load_templates(CARRIAGE_RESET_TEMPLATES)
+        suppress_templates = load_templates(NO_ALERT_TEMPLATES)
     except Exception as e:
         print(f"ERROR while loading templates: {e}")
         print("Make sure your images exist under the templates folder with the expected names.")
         return
 
-    carriage_notified = False
+    check_webhook()
+
     last_focus_hwnd = None
     last_focus_time = 0.0
+    suppress_cooldown_until = 0.0
 
     print("\n=== Carriage Finder Started ===")
     print(f"Press {HOTKEY_STOP} to stop. Press {HOTKEY_DEBUG_SCREENSHOT} to save a debug screenshot.")
@@ -187,7 +231,6 @@ def run_bot():
                     time.sleep(2)
                     continue
 
-                # Bring to front only when needed
                 if win32gui.GetForegroundWindow() != hwnd:
                     now = time.perf_counter()
                     if last_focus_hwnd != hwnd or (now - last_focus_time) > 2.0:
@@ -203,26 +246,57 @@ def run_bot():
 
                 screen_gray = cv2.cvtColor(screen_bgra, cv2.COLOR_BGRA2GRAY)
 
-                if not carriage_notified:
-                    print("\rScanning for Mythic Carriage ...", end="", flush=True)
-                    for name, tmpl in detection_templates.items():
-                        if find_template(screen_gray, tmpl, MATCH_THRESHOLD):
-                            print(f"\n*** Mythic Carriage DETECTED via {name} ***")
-                            send_discord_notification("A Mythic Carriage has appeared! ✨🐴✨")
-                            carriage_notified = True
-                            break
+                # 1) Suppressor check
+                if time.time() < suppress_cooldown_until:
+                    print("\rSuppress cooldown active ...", end="", flush=True)
                 else:
-                    print("\rCarriage detected. Waiting for event to end ...", end="", flush=True)
-                    for name, tmpl in reset_templates.items():
-                        if find_template(screen_gray, tmpl, MATCH_THRESHOLD):
-                            print(f"\nCarriage event concluded because {name} matched. Resuming search.")
-                            carriage_notified = False
-                            break
+                    no_alert_hits = find_hits(screen_gray, suppress_templates)
+                    if no_alert_hits:
+                        print(f"\n[NoAlert] Found {', '.join(no_alert_hits.keys())}. Too late to join. Suppressing for {SUPPRESS_COOLDOWN_SEC}s.")
+                        carriage_notified = False
+                        rule_pass_history.clear()
+                        suppress_cooldown_until = time.time() + SUPPRESS_COOLDOWN_SEC
+                        # fall through to sleep at end
 
-                # Keep target interval
+                # 2) Detection logic with multi-signal + stability
+                if time.time() >= suppress_cooldown_until:
+                    if not carriage_notified:
+                        print("\rScanning for Mythic Carriage ...", end="", flush=True)
+
+                        # vote among REQUIRED_DETECTION_KEYS
+                        hits = find_hits(screen_gray, detection_templates, keys=REQUIRED_DETECTION_KEYS)
+                        rule_pass = (len(hits) >= REQUIRED_DETECTION_MIN)
+
+                        # remember recent rule outcomes
+                        rule_pass_history.append(rule_pass)
+                        stable = len(rule_pass_history) == PERSIST_FRAMES and all(rule_pass_history)
+
+                        if stable:
+                            # Optionally, check reset templates are NOT present at the same time
+                            reset_hits = find_hits(screen_gray, reset_templates)
+                            if reset_hits:
+                                # If a reset UI is visible already, don't notify
+                                print(f"\n[Info] Reset-state visible ({', '.join(reset_hits.keys())}), skipping alert.")
+                                rule_pass_history.clear()
+                            else:
+                                # Fire alert once
+                                names = ", ".join(sorted(hits.keys()))
+                                print(f"\n*** Mythic Carriage DETECTED via {names} (stable {PERSIST_FRAMES} frames) ***")
+                                send_discord_notification("A Mythic Carriage has appeared! ✨🐴✨")
+                                carriage_notified = True
+                                rule_pass_history.clear()
+                    else:
+                        print("\rCarriage detected. Waiting for event to end ...", end="", flush=True)
+                        # look for reset cues to end event
+                        reset_hits = find_hits(screen_gray, reset_templates)
+                        if reset_hits:
+                            print(f"\nCarriage event concluded because {', '.join(reset_hits.keys())} matched. Resuming search.")
+                            carriage_notified = False
+                            rule_pass_history.clear()
+
+                # target rate
                 elapsed = time.perf_counter() - loop_start
-                sleep_for = max(0.0, CAPTURE_EVERY_SEC - elapsed)
-                time.sleep(sleep_for)
+                time.sleep(max(0.0, CAPTURE_EVERY_SEC - elapsed))
 
             except Exception as e:
                 print(f"\nUnexpected error: {e}")
@@ -231,6 +305,5 @@ def run_bot():
     print("\nScript stopped. Goodbye.")
 
 if __name__ == "__main__":
-    # Start hotkeys listener as daemon
     threading.Thread(target=setup_hotkeys, daemon=True).start()
     run_bot()
