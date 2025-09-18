@@ -1,289 +1,236 @@
-import time, sys, subprocess
-from pathlib import Path
-from collections import deque
-
-import numpy as np
+import os
+import time
 import cv2
-import mss
-import requests
 import psutil
+import ctypes
+import numpy as np
+import mss
+import win32gui
+import win32process
+import win32con
+import keyboard
+import requests
+import threading
 
-# Try Windows window focus helpers
-try:
-    import win32gui, win32con, win32process
-    WIN32_OK = True
-except Exception:
-    WIN32_OK = False
-
-# Hotkey support
-try:
-    import keyboard
-    KEYBOARD_OK = True
-except Exception:
-    KEYBOARD_OK = False
-
-# --------------- CONFIG ---------------
+# ======================
+# CONFIGURATION
+# ======================
 PROCESS_NAME = "TopHeroes.exe"
-USE_CLIENT_AREA = True           # kept for familiarity
+
 CAPTURE_EVERY_SEC = 0.9
-REFRESH_RECT_EVERY_SEC = 2       # not used here
+MATCH_THRESHOLD = 0.7
+
 HOTKEY_STOP = "m"
+HOTKEY_DEBUG_SCREENSHOT = "p"
 
-# Bring game to front on start
-BRING_TO_FRONT = True
-
-# Optional auto launch
-AUTO_LAUNCH = False
-GAME_EXE_PATH = r"C:\Program Files\TopHeroes\TopHeroes.exe"
-
-# Your templates folder
-TEMPLATES_DIR = Path(r"C:\Users\crumb\Desktop\CartTracker\templates")
-FILES = {
-    "invite_label":  "invite_label.png",
-    "carriage_icon": "carriage_icon.png",
-    "join_button":   "join_button.png",
-    "joined_button": "joined_button.png",
-    "close_x":       "close_x.png",   # not used for alert
-}
-
-# Your webhook
+# Load webhook from env for safety. Set DISCORD_WEBHOOK_URL in your system env if you want alerts.
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1417618033492623451/XRplkQ3uLiWXIBk25r1G5QjgF0FyCgTxV1GgZ0IzLckLcLhZdNCzTTrNHd1iziO53rPr"
 
-# Thresholds
-TH_MAIN   = 0.78   # invite_label / carriage_icon / join_button
-TH_JOINED = 0.86   # joined_button
 
-# Wider multi-scale
-SCALES = np.linspace(0.65, 1.50, 19)
+TEMPLATES_DIR = "templates"
+CARRIAGE_DETECTION_TEMPLATES = {
+    "invite_label": os.path.join(TEMPLATES_DIR, "invite_label.png"),
+    "carriage_icon": os.path.join(TEMPLATES_DIR, "carriage_icon.png"),
+    "join_button": os.path.join(TEMPLATES_DIR, "join_button.png"),
+}
+CARRIAGE_RESET_TEMPLATES = {
+    "joined_button": os.path.join(TEMPLATES_DIR, "joined_button.png"),
+    "close_x": os.path.join(TEMPLATES_DIR, "close_x.png"),
+}
 
-# Edge fallback to tolerate tiny brightness/AA changes
-EDGE_FALLBACK = True
+# ======================
+# GLOBALS
+# ======================
+running = True
+last_screenshot = None
+script_lock = threading.Lock()
 
-# Anti spam
-ALERT_COOLDOWN_SEC = 18
-
-# Heartbeat so you know it is scanning
-HEARTBEAT_EVERY_N_FRAMES = 5
-DEBUG_SCORES = True
-# --------------------------------------
-
-
-def send_webhook(msg):
+# ======================
+# UTIL
+# ======================
+def _pid_has_name(pid: int, name: str) -> bool:
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=5)
-    except Exception:
-        pass
+        p = psutil.Process(pid)
+        return p.name().lower() == name.lower()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
 
+def find_game_window(process_name: str):
+    """Return (hwnd, rect) for the first visible, enabled top level window owned by process_name. Otherwise (None, None)."""
+    target = {"hwnd": None, "rect": None}
 
-def is_running(name: str) -> bool:
-    name = name.lower()
-    for p in psutil.process_iter(["name"]):
+    def callback(h, _):
+        if not win32gui.IsWindowVisible(h) or not win32gui.IsWindowEnabled(h):
+            return True
         try:
-            if (p.info["name"] or "").lower() == name:
-                return True
-        except psutil.Error:
-            continue
-    return False
-
-
-def maybe_launch_game():
-    if not AUTO_LAUNCH:
-        return
-    if not is_running(PROCESS_NAME) and GAME_EXE_PATH and Path(GAME_EXE_PATH).exists():
-        try:
-            subprocess.Popen([GAME_EXE_PATH], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-
-
-def enum_hwnds_for_pid(pid):
-    hwnds = []
-    def cb(hwnd, extra):
-        try:
-            tid, hwnd_pid = win32process.GetWindowThreadProcessId(hwnd)
-            if hwnd_pid == pid and win32gui.IsWindowVisible(hwnd):
-                hwnds.append(hwnd)
+            _, pid = win32process.GetWindowThreadProcessId(h)
+            if pid and _pid_has_name(pid, process_name):
+                rect = win32gui.GetWindowRect(h)
+                target["hwnd"] = h
+                target["rect"] = rect
+                return False  # stop enum
         except Exception:
             pass
         return True
-    win32gui.EnumWindows(cb, None)
-    return hwnds
 
+    win32gui.EnumWindows(callback, None)
+    return target["hwnd"], target["rect"]
 
-def focus_topheroes_window():
-    if not WIN32_OK:
-        return False
-    target_pid = None
-    for p in psutil.process_iter(["name", "pid"]):
-        if (p.info["name"] or "").lower() == PROCESS_NAME.lower():
-            target_pid = p.info["pid"]
-            break
-    if not target_pid:
-        return False
-
-    hwnds = enum_hwnds_for_pid(target_pid)
-    if not hwnds:
-        return False
-
-    hwnd = None
-    for h in hwnds:
-        title = win32gui.GetWindowText(h)
-        if title:
-            hwnd = h
-            break
-    if hwnd is None:
-        hwnd = hwnds[0]
-
+def focus_window(hwnd):
+    """Try to restore and bring window to foreground."""
     try:
+        # Restore if minimized
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
-                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
-        win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
-                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+        # Simple foreground attempt
         win32gui.SetForegroundWindow(hwnd)
-        return True
     except Exception:
-        return False
-
-
-def load_templates():
-    bank = {}
-    for key, fname in FILES.items():
-        p = TEMPLATES_DIR / fname
-        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(f"Template missing or unreadable: {p}")
-        bank[key] = img
-    return bank
-
-
-def best_match_multi_scale(haystack_gray, needle_gray, method=cv2.TM_CCOEFF_NORMED):
-    def prep_edges(img):
-        g = cv2.GaussianBlur(img, (3,3), 0)
-        e = cv2.Canny(g, 60, 120)
-        return e
-
-    best_val, best_tl, best_br, best_s = -1.0, None, None, None
-    hN, wN = needle_gray.shape[:2]
-
-    # First try raw grayscale
-    for s in SCALES:
-        w = max(8, int(wN * s)); h = max(8, int(hN * s))
-        tpl = cv2.resize(needle_gray, (w, h), interpolation=cv2.INTER_AREA)
-        if haystack_gray.shape[0] < h or haystack_gray.shape[1] < w:
-            continue
-        res = cv2.matchTemplate(haystack_gray, tpl, method)
-        _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        if max_val > best_val:
-            best_val = max_val
-            best_tl = max_loc
-            best_br = (max_loc[0] + w, max_loc[1] + h)
-            best_s = s
-
-    # If weak and allowed, try edge-based
-    if EDGE_FALLBACK and best_val < 0.78:
-        H = prep_edges(haystack_gray)
-        best2 = (-1.0, None, None, None)
-        for s in SCALES:
-            w = max(8, int(wN * s)); h = max(8, int(hN * s))
-            tpl = cv2.resize(needle_gray, (w, h), interpolation=cv2.INTER_AREA)
-            T = prep_edges(tpl)
-            if H.shape[0] < h or H.shape[1] < w:
-                continue
-            res = cv2.matchTemplate(H, T, method)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
-            if max_val > best2[0]:
-                tl = max_loc
-                br = (tl[0] + w, tl[1] + h)
-                best2 = (max_val, tl, br, s)
-        if best2[0] > best_val:
-            best_val, best_tl, best_br, best_s = best2
-
-    return best_val, best_tl, best_br, best_s
-
-
-def main():
-    maybe_launch_game()
-    if BRING_TO_FRONT:
-        focus_topheroes_window()
-
-    bank = load_templates()
-
-    # Capture ALL monitors
-    sct = mss.mss()
-    monitor = sct.monitors[0]  # virtual screen covering all displays
-
-    stop_flag = {"v": False}
-    if KEYBOARD_OK:
+        # Foreground permission workaround
         try:
-            keyboard.add_hotkey(HOTKEY_STOP, lambda: stop_flag.__setitem__("v", True))
+            user32 = ctypes.windll.user32
+            cur_thread = win32process.GetCurrentThreadId()
+            fg_hwnd = user32.GetForegroundWindow()
+            fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, 0)
+            user32.AttachThreadInput(cur_thread, fg_thread, True)
+            win32gui.SetForegroundWindow(hwnd)
+            user32.AttachThreadInput(cur_thread, fg_thread, False)
         except Exception:
-            pass  # Ctrl+C still works
+            pass
 
-    print(f"Watcher running. Scanning ALL monitors every {CAPTURE_EVERY_SEC:.1f}s. "
-          f"Press '{HOTKEY_STOP}' or Ctrl+C to stop. Waiting for a carriage...")
+def rect_to_monitor(rect):
+    left, top, right, bottom = rect
+    return {"left": left, "top": top, "width": right - left, "height": bottom - top}
 
-    last_alert_ts = 0.0
-    frame_i = 0
-
-    try:
-        while True:
-            if stop_flag["v"]:
-                break
-
-            frame_i += 1
-            img = np.array(sct.grab(monitor))   # BGRA across all displays
+def load_templates(paths_dict):
+    """Read templates once and cache grayscale versions. Return dict[name] = gray_image."""
+    loaded = {}
+    for name, path in paths_dict.items():
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise FileNotFoundError(f"Template not found: {path}")
+        if img.shape[-1] == 4:
             gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+        else:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        loaded[name] = gray
+    return loaded
 
-            # Scores
-            scores = {}
-            for key in ("invite_label", "carriage_icon", "join_button"):
-                sc, _, _, _ = best_match_multi_scale(gray, bank[key])
-                scores[key] = sc
-            joined_sc, _, _, _ = best_match_multi_scale(gray, bank["joined_button"])
+def find_template(screen_gray, template_gray, threshold):
+    """Basic template match, returns True if any location meets threshold."""
+    if screen_gray.shape[0] < template_gray.shape[0] or screen_gray.shape[1] < template_gray.shape[1]:
+        return False
+    result = cv2.matchTemplate(screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, _ = cv2.minMaxLoc(result)
+    return max_val >= threshold
 
-            carriage = (
-                scores["invite_label"]  >= TH_MAIN or
-                scores["carriage_icon"] >= TH_MAIN or
-                scores["join_button"]   >= TH_MAIN
-            )
+def send_discord_notification(message):
+    if not DISCORD_WEBHOOK_URL:
+        print("WARN Discord webhook URL not set. Skipping notification.")
+        return
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+        if r.status_code in (200, 204):
+            print("Discord notification sent.")
+        else:
+            print(f"Discord error {r.status_code} {r.text}")
+    except requests.RequestException as e:
+        print(f"Discord request failed {e}")
 
-            # Heartbeat
-            if HEARTBEAT_EVERY_N_FRAMES and frame_i % HEARTBEAT_EVERY_N_FRAMES == 0:
-                if DEBUG_SCORES:
-                    print(
-                        f"[waiting] invite={scores['invite_label']:.2f} "
-                        f"icon={scores['carriage_icon']:.2f} "
-                        f"join={scores['join_button']:.2f} "
-                        f"joined={joined_sc:.2f}",
-                        end="\r", flush=True
-                    )
+def stop_script():
+    global running
+    print(f"\nHotkey {HOTKEY_STOP} pressed. Stopping...")
+    running = False
+
+def save_debug_screenshot():
+    with script_lock:
+        if last_screenshot is None:
+            print("\n[DEBUG] No screenshot yet.")
+            return
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        fn = f"debug_screenshot_{ts}.png"
+        cv2.imwrite(fn, last_screenshot)
+        print(f"\n[DEBUG] Saved {fn}")
+
+def setup_hotkeys():
+    keyboard.add_hotkey(HOTKEY_STOP, stop_script)
+    keyboard.add_hotkey(HOTKEY_DEBUG_SCREENSHOT, save_debug_screenshot)
+    keyboard.wait()
+
+# ======================
+# MAIN BOT
+# ======================
+def run_bot():
+    global last_screenshot
+
+    print("Loading templates...")
+    try:
+        detection_templates = load_templates(CARRIAGE_DETECTION_TEMPLATES)
+        reset_templates = load_templates(CARRIAGE_RESET_TEMPLATES)
+    except Exception as e:
+        print(f"ERROR while loading templates: {e}")
+        print("Make sure your images exist under the templates folder with the expected names.")
+        return
+
+    carriage_notified = False
+    last_focus_hwnd = None
+    last_focus_time = 0.0
+
+    print("\n=== Carriage Finder Started ===")
+    print(f"Press {HOTKEY_STOP} to stop. Press {HOTKEY_DEBUG_SCREENSHOT} to save a debug screenshot.")
+
+    with mss.mss() as sct:
+        while running:
+            loop_start = time.perf_counter()
+            try:
+                hwnd, rect = find_game_window(PROCESS_NAME)
+                if not hwnd or not rect:
+                    print(f"\rWaiting for game window {PROCESS_NAME} ...", end="", flush=True)
+                    time.sleep(2)
+                    continue
+
+                # Bring to front only when needed
+                if win32gui.GetForegroundWindow() != hwnd:
+                    now = time.perf_counter()
+                    if last_focus_hwnd != hwnd or (now - last_focus_time) > 2.0:
+                        focus_window(hwnd)
+                        last_focus_hwnd = hwnd
+                        last_focus_time = now
+
+                monitor = rect_to_monitor(rect)
+                screen_bgra = np.array(sct.grab(monitor))
+
+                with script_lock:
+                    last_screenshot = screen_bgra
+
+                screen_gray = cv2.cvtColor(screen_bgra, cv2.COLOR_BGRA2GRAY)
+
+                if not carriage_notified:
+                    print("\rScanning for Mythic Carriage ...", end="", flush=True)
+                    for name, tmpl in detection_templates.items():
+                        if find_template(screen_gray, tmpl, MATCH_THRESHOLD):
+                            print(f"\n*** Mythic Carriage DETECTED via {name} ***")
+                            send_discord_notification("A Mythic Carriage has appeared! ✨🐴✨")
+                            carriage_notified = True
+                            break
                 else:
-                    print("[waiting for carriage...]", end="\r", flush=True)
+                    print("\rCarriage detected. Waiting for event to end ...", end="", flush=True)
+                    for name, tmpl in reset_templates.items():
+                        if find_template(screen_gray, tmpl, MATCH_THRESHOLD):
+                            print(f"\nCarriage event concluded because {name} matched. Resuming search.")
+                            carriage_notified = False
+                            break
 
-            now = time.time()
-            if carriage and (now - last_alert_ts) >= ALERT_COOLDOWN_SEC:
-                if joined_sc >= TH_JOINED:
-                    msg = "🟢 **Carriage spotted** (already joined)."
-                else:
-                    msg = "🟢 **Carriage appeared!** Check chat now."
-                print("\nALERT -> sending Discord webhook:", msg)
-                send_webhook(msg)
-                last_alert_ts = now
+                # Keep target interval
+                elapsed = time.perf_counter() - loop_start
+                sleep_for = max(0.0, CAPTURE_EVERY_SEC - elapsed)
+                time.sleep(sleep_for)
 
-            # Optional quick dump: press 'd' to save current frame
-            if KEYBOARD_OK and keyboard.is_pressed('d'):
-                out = Path("debug_frame.png")
-                cv2.imwrite(str(out), gray)
-                print(f"\nSaved {out} for debugging.")
+            except Exception as e:
+                print(f"\nUnexpected error: {e}")
+                time.sleep(3)
 
-            time.sleep(CAPTURE_EVERY_SEC)
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        print("\nStopped.")
-
+    print("\nScript stopped. Goodbye.")
 
 if __name__ == "__main__":
-    main()
+    # Start hotkeys listener as daemon
+    threading.Thread(target=setup_hotkeys, daemon=True).start()
+    run_bot()
